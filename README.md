@@ -13,7 +13,7 @@ They work best when the provider exposes an OpenAI-compatible `/v1/chat/completi
 - a Hermes provider profile named `sap-aicore`
 - a local OpenAI-compatible proxy at `http://127.0.0.1:8765/v1`
 - token exchange and token caching for SAP AI Core service-key JSON files
-- model-to-deployment mapping, where the Hermes model id is used as the SAP AI Core deployment id
+- foundation mode, where the Hermes model id can be used as the SAP AI Core deployment id
 - orchestration mode, where SAP's orchestration `final_result` is normalized back to OpenAI chat-completions JSON
 
 ## Install
@@ -24,11 +24,11 @@ From this directory:
 python3 -m pip install -e .
 hermes-sap-aicore-install \
   --service-key /path/to/hermes-key.json \
-  --deployment-id <SAP_AI_CORE_DEPLOYMENT_ID> \
+  --deployment-id <SAP_AI_CORE_ORCHESTRATION_DEPLOYMENT_ID> \
   --api-mode orchestration \
   --model-name anthropic--claude-4.5-sonnet \
   --resource-group default \
-  --write-env
+  --write-env --write-config
 ```
 
 The installer writes the drop-in provider to:
@@ -37,7 +37,10 @@ The installer writes the drop-in provider to:
 ~/.hermes/plugins/model-providers/sap-aicore/
 ```
 
-It also appends missing values to `~/.hermes/.env` when `--write-env` is set.
+- `--write-env` appends missing values to `~/.hermes/.env`.
+- `--write-config` registers `sap-aicore` under `providers:` in `~/.hermes/config.yaml`. This is **required** for the interactive `/model` picker: the picker's provider switch resolves through `config.yaml` providers + models.dev, which is a different registry than the plugin profile. Without the entry you get `Unknown provider 'sap-aicore'`. `--write-env` implies `--write-config`.
+
+> After installing, fully restart the `hermes` session so it reloads the plugin registry and config.
 
 ## Run
 
@@ -47,22 +50,20 @@ Start the proxy in one terminal:
 sap-aicore-hermes-proxy
 ```
 
-Then run Hermes with the SAP AI Core provider:
-
-```bash
-hermes -z "Say hello in one sentence." --provider sap-aicore -m <SAP_AI_CORE_DEPLOYMENT_ID>
-```
-
-For orchestration mode, `-m` is the foundation model name unless `SAP_AICORE_MODEL_NAME` is set:
+Then run Hermes with the SAP AI Core provider. In orchestration mode, the Hermes model is the foundation model name:
 
 ```bash
 hermes -z "Say hello in one sentence." --provider sap-aicore -m anthropic--claude-4.5-sonnet
 ```
 
-You can also set multiple visible model/deployment ids for the Hermes model picker:
+Or interactively: run `hermes`, `/model`, pick **SAP AI Core**, then pick a model.
+
+### Model picker contents
+
+By default the proxy lists **all live chat-capable models** found in your SAP AI Core tenant. It queries `/v2/lm/deployments` (status `RUNNING`) and, in orchestration mode, returns the foundation model names (embedding and RPT deployments are filtered out). To pin a fixed list instead of live discovery:
 
 ```bash
-export SAP_AICORE_MODELS="deployment-a,deployment-b"
+export SAP_AICORE_MODELS="anthropic--claude-4.5-sonnet,gpt-5.5"
 ```
 
 ## Configuration
@@ -70,13 +71,14 @@ export SAP_AICORE_MODELS="deployment-a,deployment-b"
 Required:
 
 - `SAP_AICORE_SERVICE_KEY` or `SAP_AICORE_SERVICE_KEY_FILE`: path to the SAP AI Core service-key JSON
-- `SAP_AICORE_DEPLOYMENT_ID` or the Hermes `-m` model value: SAP AI Core deployment id
+- `SAP_AICORE_DEPLOYMENT_ID`: SAP AI Core deployment id
 - `SAP_AICORE_PROXY_KEY`: local key Hermes sends to the proxy; it is not forwarded to SAP
 
 Optional:
 
-- `SAP_AICORE_API_MODE`: `foundation` for `/chat/completions`, `orchestration` for `/v2/completion`
-- `SAP_AICORE_MODEL_NAME`: foundation model name used by orchestration mode; when unset, Hermes `-m` is used
+- `SAP_AICORE_API_MODE`: `foundation` for `/chat/completions`, `orchestration` for `/v2/completion` (default `orchestration`)
+- `SAP_AICORE_MODEL_NAME`: fallback foundation model for orchestration when no model is selected; the model picked in Hermes always wins
+- `SAP_AICORE_MODELS`: comma-separated list to pin the model picker; when unset, the proxy lists all live AI Core chat models
 - `SAP_AICORE_RESOURCE_GROUP`: defaults to `default`
 - `SAP_AICORE_PROXY_BASE_URL`: defaults to `http://127.0.0.1:8765/v1`
 - `SAP_AICORE_PROXY_HOST`: defaults to `127.0.0.1`

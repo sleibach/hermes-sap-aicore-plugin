@@ -8,14 +8,23 @@ import os
 DEFAULT_PROXY_BASE_URL = "http://127.0.0.1:8765/v1"
 
 
+def _load_env() -> None:
+    try:
+        from .config import _load_hermes_dotenv
+
+        _load_hermes_dotenv()
+    except Exception:
+        pass
+
+
 def _fallback_models() -> tuple[str, ...]:
+    _load_env()
     configured = (
         os.getenv("SAP_AICORE_MODELS", "").strip()
-        or os.getenv("SAP_AICORE_DEPLOYMENT_ID", "").strip()
-        or os.getenv("AICORE_DEPLOYMENT_ID", "").strip()
+        or os.getenv("SAP_AICORE_MODEL_NAME", "").strip()
     )
     models = [item.strip() for item in configured.replace(";", ",").split(",") if item.strip()]
-    return tuple(models or ["sap-aicore-deployment"])
+    return tuple(models or ["sap-aicore-model"])
 
 
 def register() -> None:
@@ -29,13 +38,14 @@ def register() -> None:
     from providers import register_provider
     from providers.base import ProviderProfile
 
+    _load_env()
     profile = ProviderProfile(
         name="sap-aicore",
         aliases=("aicore", "sap-ai-core", "generative-ai-hub", "genaihub"),
         display_name="SAP AI Core",
         description=(
             "SAP AI Core Generative AI Hub via local OpenAI-compatible proxy. "
-            "Use Hermes model id as the AI Core deployment id."
+            "In orchestration mode, use Hermes model id as the foundation model name."
         ),
         signup_url="https://help.sap.com/docs/sap-ai-core",
         env_vars=("SAP_AICORE_PROXY_KEY", "SAP_AICORE_PROXY_BASE_URL"),
