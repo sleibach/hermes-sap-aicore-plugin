@@ -7,6 +7,7 @@ from hermes_sap_aicore.proxy import (
     _as_openai_response,
     _as_openai_sse,
     _active_mode,
+    _context_length_for_model,
     _deployment_from_model,
     _deployment_model_name,
     _is_chat_model,
@@ -55,20 +56,34 @@ def _isolate_env(monkeypatch, tmp_path):
 
 def test_models_payload_pins_explicit_models(monkeypatch, tmp_path):
     _isolate_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("SAP_AICORE_MODELS", "dep-a,dep-b")
+    monkeypatch.setenv("SAP_AICORE_MODELS", "gpt-5.5,anthropic--claude-4.7-opus")
 
     payload = _models_payload()
 
-    assert [item["id"] for item in payload["data"]] == ["dep-a", "dep-b"]
+    assert [item["id"] for item in payload["data"]] == ["gpt-5.5", "anthropic--claude-4.7-opus"]
+    assert [item["context_length"] for item in payload["data"]] == [1_050_000, 1_000_000]
 
 
 def test_models_payload_uses_live_listing(monkeypatch, tmp_path):
     _isolate_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(proxy, "_live_models", lambda: ["gpt-5.5", "anthropic--claude-4.5-sonnet"])
+    monkeypatch.setattr(
+        proxy,
+        "_live_model_items",
+        lambda: [
+            {"id": "gpt-5.5", "object": "model", "owned_by": "sap-ai-core", "context_length": 1_050_000},
+            {
+                "id": "anthropic--claude-4.7-opus",
+                "object": "model",
+                "owned_by": "sap-ai-core",
+                "context_length": 1_000_000,
+            },
+        ],
+    )
 
     payload = _models_payload()
 
-    assert [item["id"] for item in payload["data"]] == ["gpt-5.5", "anthropic--claude-4.5-sonnet"]
+    assert [item["id"] for item in payload["data"]] == ["gpt-5.5", "anthropic--claude-4.7-opus"]
+    assert [item["context_length"] for item in payload["data"]] == [1_050_000, 1_000_000]
 
 
 def test_models_payload_falls_back_to_model_name(monkeypatch, tmp_path):
@@ -78,11 +93,23 @@ def test_models_payload_falls_back_to_model_name(monkeypatch, tmp_path):
     def _boom():
         raise RuntimeError("no network")
 
-    monkeypatch.setattr(proxy, "_live_models", _boom)
+    monkeypatch.setattr(proxy, "_live_model_items", _boom)
 
     payload = _models_payload()
 
     assert [item["id"] for item in payload["data"]] == ["anthropic--claude-4.5-sonnet"]
+    assert payload["data"][0]["context_length"] == 200_000
+
+
+def test_context_length_for_model_uses_ai_core_model_id():
+    assert _context_length_for_model("anthropic--claude-4.7-opus") == 1_000_000
+    assert _context_length_for_model("anthropic--claude-4.5-sonnet") == 200_000
+    assert _context_length_for_model("gpt-5.5") == 1_050_000
+
+
+def test_context_length_for_model_prefers_deployment_metadata():
+    deployment = {"details": {"limits": {"contextWindow": 777_000}}}
+    assert _context_length_for_model("anthropic--claude-4.7-opus", deployment) == 777_000
 
 
 def test_is_chat_model_filters_embeddings_and_rpt():

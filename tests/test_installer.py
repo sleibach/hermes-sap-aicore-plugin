@@ -35,7 +35,14 @@ def test_configure_config_yaml_registers_provider(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
-            {"model": {"provider": "sap-aicore", "base_url": "https://openrouter.ai/api/v1"}, "providers": {}}
+            {
+                "model": {
+                    "default": "anthropic--claude-4.7-opus",
+                    "provider": "sap-aicore",
+                    "base_url": "https://openrouter.ai/api/v1",
+                },
+                "providers": {},
+            }
         ),
         encoding="utf-8",
     )
@@ -48,6 +55,7 @@ def test_configure_config_yaml_registers_provider(tmp_path):
     assert entry["key_env"] == "SAP_AICORE_PROXY_KEY"
     assert entry["transport"] == "openai_chat"
     assert data["model"]["base_url"] == "http://127.0.0.1:8765/v1"
+    assert "context_length" not in data["model"]
     assert data["agent"]["tool_use_enforcement"] == [
         "anthropic--",
         "gpt",

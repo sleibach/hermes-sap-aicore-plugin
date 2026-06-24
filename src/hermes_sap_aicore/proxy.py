@@ -21,6 +21,23 @@ from .config import AiCoreConfig, ConfigError, load_config
 LOGGER = logging.getLogger("hermes_sap_aicore.proxy")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+DEFAULT_CONTEXT_LENGTHS = {
+    "anthropic--claude-4.7-opus": 1_000_000,
+    "anthropic--claude-4.5-sonnet": 200_000,
+    "gpt-5.5": 1_050_000,
+}
+CONTEXT_LENGTH_KEYS = {
+    "contextLength",
+    "context_length",
+    "contextWindow",
+    "context_window",
+    "maxContextLength",
+    "max_context_length",
+    "maxInputTokens",
+    "max_input_tokens",
+    "maxModelLen",
+    "max_model_len",
+}
 
 
 class TokenCache:
@@ -159,6 +176,45 @@ def _is_chat_model(name: str) -> bool:
     return True
 
 
+def _extract_context_length(value: Any) -> int | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in CONTEXT_LENGTH_KEYS and isinstance(item, int) and item > 0:
+                return item
+        for item in value.values():
+            context_length = _extract_context_length(item)
+            if context_length:
+                return context_length
+    elif isinstance(value, list):
+        for item in value:
+            context_length = _extract_context_length(item)
+            if context_length:
+                return context_length
+    return None
+
+
+def _context_length_for_model(model: str, deployment: dict[str, Any] | None = None) -> int | None:
+    if deployment:
+        explicit = _extract_context_length(deployment)
+        if explicit:
+            return explicit
+    normalized = (model or "").strip().lower()
+    if not normalized:
+        return None
+    for name, context_length in DEFAULT_CONTEXT_LENGTHS.items():
+        if normalized == name or name in normalized:
+            return context_length
+    if normalized.startswith("anthropic--claude-4.7"):
+        return 1_000_000
+    if normalized.startswith("anthropic--claude-4.8") or normalized.startswith("anthropic--claude-fable"):
+        return 1_000_000
+    if normalized.startswith("anthropic--claude-"):
+        return 200_000
+    if normalized.startswith("gpt-5.5"):
+        return 1_050_000
+    return None
+
+
 def _fetch_deployments(config: AiCoreConfig, token: str) -> list[dict[str, Any]]:
     url = config.inference_base_url + "/lm/deployments?" + urllib.parse.urlencode({"status": "RUNNING"})
     request = urllib.request.Request(
@@ -185,35 +241,42 @@ def _deployment_model_name(deployment: dict[str, Any]) -> str:
     return ""
 
 
-def _live_models() -> list[str]:
+def _model_item(model: str, deployment: dict[str, Any] | None = None) -> dict[str, Any]:
+    item = {"id": model, "object": "model", "owned_by": "sap-ai-core"}
+    context_length = _context_length_for_model(model, deployment)
+    if context_length:
+        item["context_length"] = context_length
+    return item
+
+
+def _live_model_items() -> list[dict[str, Any]]:
     """Query SAP AI Core for the catalog the active mode can actually serve."""
     config = load_config(os.getenv("SAP_AICORE_DEPLOYMENT_ID", "") or os.getenv("AICORE_DEPLOYMENT_ID", "") or "list")
     token = TOKEN_CACHE.get(config)
     deployments = _fetch_deployments(config, token)
 
     if _active_mode() == "orchestration":
-        names = sorted(
-            {
-                name
-                for dep in deployments
-                if dep.get("scenarioId") in {"foundation-models", None} or _deployment_model_name(dep)
-                for name in [_deployment_model_name(dep)]
-                if _is_chat_model(name)
-            }
-        )
-        return names
+        by_name: dict[str, dict[str, Any]] = {}
+        for dep in deployments:
+            if dep.get("scenarioId") not in {"foundation-models", None} and not _deployment_model_name(dep):
+                continue
+            name = _deployment_model_name(dep)
+            if _is_chat_model(name) and name not in by_name:
+                by_name[name] = _model_item(name, dep)
+        return [by_name[name] for name in sorted(by_name)]
 
     # Foundation mode routes by deployment id, so the model id IS the deployment id.
-    ids = []
+    items = []
     for dep in deployments:
         if dep.get("scenarioId") not in {"foundation-models", None}:
             continue
-        if not _is_chat_model(_deployment_model_name(dep)):
+        model_name = _deployment_model_name(dep)
+        if not _is_chat_model(model_name):
             continue
         dep_id = str(dep.get("id") or "").strip()
         if dep_id:
-            ids.append(dep_id)
-    return sorted(ids)
+            items.append(_model_item(dep_id, dep))
+    return sorted(items, key=lambda item: item["id"])
 
 
 def _models_payload() -> dict[str, Any]:
@@ -222,20 +285,21 @@ def _models_payload() -> dict[str, Any]:
     _load_hermes_dotenv()
     configured = os.getenv("SAP_AICORE_MODELS", "").strip()
     models = [item.strip() for item in configured.replace(";", ",").split(",") if item.strip()]
+    model_items: list[dict[str, Any]] = [_model_item(model) for model in models]
 
-    if not models:
+    if not model_items:
         try:
-            models = _live_models()
+            model_items = _live_model_items()
         except Exception as exc:
             LOGGER.warning("Live model listing failed, falling back to configured model: %s", exc)
 
-    if not models:
+    if not model_items:
         fallback = os.getenv("SAP_AICORE_MODEL_NAME", "").strip()
-        models = [fallback] if fallback else ["sap-aicore-model"]
+        model_items = [_model_item(fallback)] if fallback else [_model_item("sap-aicore-model")]
 
     return {
         "object": "list",
-        "data": [{"id": model, "object": "model", "owned_by": "sap-ai-core"} for model in models],
+        "data": model_items,
     }
 
 
