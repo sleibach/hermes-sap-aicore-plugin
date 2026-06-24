@@ -58,6 +58,21 @@ def _http_error_body(exc: urllib.error.HTTPError) -> str:
         return str(exc)
 
 
+def _log_aicore_http_error(kind: str, status: int, body: bytes) -> None:
+    raw = body.decode("utf-8", errors="replace")
+    message = raw[:500]
+    try:
+        data = json.loads(raw)
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error, dict):
+            request_id = str(error.get("request_id") or "").strip()
+            error_message = str(error.get("message") or "").strip()
+            message = f"{error_message} request_id={request_id}".strip()
+    except Exception:
+        pass
+    LOGGER.warning("SAP AI Core %s request failed with HTTP %s: %s", kind, status, message)
+
+
 def _request_token(config: AiCoreConfig, *, use_basic_auth: bool) -> tuple[str, int]:
     form: dict[str, str] = {"grant_type": "client_credentials"}
     headers = {
@@ -245,6 +260,44 @@ def _model_params(payload: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _stringify_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _orchestration_messages(messages: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    if not isinstance(messages, list):
+        return normalized
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        if role in {"system", "user", "assistant"}:
+            content = message.get("content") or ""
+            if role == "assistant" and not _stringify_content(content).strip():
+                continue
+            sanitized: dict[str, Any] = {
+                "role": role,
+                "content": content,
+            }
+            normalized.append(sanitized)
+            continue
+        if role in {"tool", "function"}:
+            tool_name = str(message.get("name") or message.get("tool_call_id") or "tool").strip()
+            content = _stringify_content(message.get("content", ""))
+            normalized.append(
+                {
+                    "role": "user",
+                    "content": f"Tool result ({tool_name}):\n{content}",
+                }
+            )
+
+    return normalized
+
+
 def _orchestration_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # The model picked in Hermes wins; the env default is only a fallback so a
     # bare `hermes` session without an explicit model still works.
@@ -254,7 +307,7 @@ def _orchestration_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not model_name or model_name in {"sap-aicore-model", "sap-aicore-deployment"}:
         raise ConfigError("Hermes model or SAP_AICORE_MODEL_NAME must contain the AI Core foundation model name")
 
-    prompt: dict[str, Any] = {"template": payload.get("messages") or []}
+    prompt: dict[str, Any] = {"template": _orchestration_messages(payload.get("messages") or [])}
     if payload.get("tools"):
         prompt["tools"] = payload["tools"]
     if payload.get("tool_choice"):
@@ -298,15 +351,48 @@ def _as_openai_sse(body: bytes) -> bytes:
         "created": response.get("created", int(time.time())),
         "model": response.get("model", ""),
     }
+    chunks: list[str] = []
     first = dict(chunk_base)
-    first["choices"] = [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}]
+    first_delta: dict[str, Any] = {"role": "assistant"}
+    if content:
+        first_delta["content"] = content
+    first["choices"] = [{"index": 0, "delta": first_delta, "finish_reason": None}]
+    chunks.append(f"data: {json.dumps(first)}\n\n")
+
+    for index, tool_call in enumerate(message.get("tool_calls") or []):
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        arguments = function.get("arguments", "")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments)
+        tool_chunk = dict(chunk_base)
+        tool_chunk["choices"] = [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": index,
+                            "id": tool_call.get("id") or f"call_sap_aicore_{index}",
+                            "type": tool_call.get("type") or "function",
+                            "function": {
+                                "name": function.get("name") or "",
+                                "arguments": arguments,
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ]
+        chunks.append(f"data: {json.dumps(tool_chunk)}\n\n")
+
     last = dict(chunk_base)
     last["choices"] = [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason") or "stop"}]
-    return (
-        f"data: {json.dumps(first)}\n\n"
-        f"data: {json.dumps(last)}\n\n"
-        "data: [DONE]\n\n"
-    ).encode("utf-8")
+    chunks.append(f"data: {json.dumps(last)}\n\n")
+    chunks.append("data: [DONE]\n\n")
+    return "".join(chunks).encode("utf-8")
 
 
 def _runtime_config(payload: dict[str, Any]) -> AiCoreConfig:
@@ -341,7 +427,9 @@ def _forward_foundation_chat_completion(payload: dict[str, Any]) -> tuple[int, b
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             TOKEN_CACHE.clear()
-        return exc.code, exc.read(), exc.headers.get_content_type() or "application/json"
+        error_body = exc.read()
+        _log_aicore_http_error("foundation", exc.code, error_body)
+        return exc.code, error_body, exc.headers.get_content_type() or "application/json"
 
 
 def _forward_orchestration_completion(payload: dict[str, Any]) -> tuple[int, bytes, str]:
@@ -373,7 +461,9 @@ def _forward_orchestration_completion(payload: dict[str, Any]) -> tuple[int, byt
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             TOKEN_CACHE.clear()
-        return exc.code, exc.read(), exc.headers.get_content_type() or "application/json"
+        error_body = exc.read()
+        _log_aicore_http_error("orchestration", exc.code, error_body)
+        return exc.code, error_body, exc.headers.get_content_type() or "application/json"
 
 
 def _forward_chat_completion(payload: dict[str, Any]) -> tuple[int, bytes, str]:
