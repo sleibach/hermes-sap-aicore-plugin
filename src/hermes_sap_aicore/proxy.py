@@ -332,16 +332,52 @@ def _orchestration_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _as_openai_response(body: bytes) -> bytes:
+def _looks_like_incomplete_tool_intent(content: str) -> bool:
+    text = " ".join((content or "").strip().lower().split())
+    if not text:
+        return False
+    starters = (
+        "let me ",
+        "i'll ",
+        "i will ",
+        "i need to ",
+        "i should ",
+        "now let me ",
+        "next, i'll ",
+        "next i'll ",
+    )
+    actions = ("check", "inspect", "look", "read", "search", "explore", "find", "open", "analyze")
+    return text.startswith(starters) and any(action in text[:160] for action in actions)
+
+
+def _nudge_incomplete_tool_intent(response: dict[str, Any], request_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not request_payload or not request_payload.get("tools"):
+        return response
+    choices = response.get("choices") if isinstance(response, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return response
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return response
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    if message.get("tool_calls"):
+        return response
+    content = message.get("content") if isinstance(message.get("content"), str) else ""
+    if _looks_like_incomplete_tool_intent(content):
+        choice["finish_reason"] = "length"
+    return response
+
+
+def _as_openai_response(body: bytes, request_payload: dict[str, Any] | None = None) -> bytes:
     data = json.loads(body.decode("utf-8"))
     final_result = data.get("final_result")
     if isinstance(final_result, dict):
-        return json.dumps(final_result).encode("utf-8")
+        return json.dumps(_nudge_incomplete_tool_intent(final_result, request_payload)).encode("utf-8")
     return body
 
 
-def _as_openai_sse(body: bytes) -> bytes:
-    response = json.loads(_as_openai_response(body).decode("utf-8"))
+def _as_openai_sse(body: bytes, request_payload: dict[str, Any] | None = None) -> bytes:
+    response = json.loads(_as_openai_response(body, request_payload).decode("utf-8"))
     choice = (response.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     content = message.get("content") or ""
@@ -456,8 +492,8 @@ def _forward_orchestration_completion(payload: dict[str, Any]) -> tuple[int, byt
         with urllib.request.urlopen(request, timeout=int(os.getenv("SAP_AICORE_TIMEOUT", "600"))) as response:
             response_body = response.read()
             if wants_stream:
-                return response.status, _as_openai_sse(response_body), "text/event-stream"
-            return response.status, _as_openai_response(response_body), "application/json"
+                return response.status, _as_openai_sse(response_body, payload), "text/event-stream"
+            return response.status, _as_openai_response(response_body, payload), "application/json"
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             TOKEN_CACHE.clear()

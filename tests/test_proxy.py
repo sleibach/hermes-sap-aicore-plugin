@@ -4,6 +4,7 @@ import hermes_sap_aicore.proxy as proxy
 from hermes_sap_aicore.config import AiCoreConfig
 from hermes_sap_aicore.proxy import (
     _aicore_url,
+    _as_openai_response,
     _as_openai_sse,
     _active_mode,
     _deployment_from_model,
@@ -198,3 +199,41 @@ def test_openai_sse_preserves_tool_calls():
     assert '"name": "terminal"' in sse
     assert '"arguments": "{\\"command\\": \\"pwd\\"}"' in sse
     assert '"finish_reason": "tool_calls"' in sse
+
+
+def test_openai_response_marks_incomplete_tool_intent_as_length():
+    body = b"""{
+      "final_result": {
+        "choices": [{
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Let me read the key files next."
+          },
+          "finish_reason": "stop"
+        }]
+      }
+    }"""
+
+    response = _as_openai_response(body, {"tools": [{"type": "function", "function": {"name": "read_file"}}]})
+
+    assert b'"finish_reason": "length"' in response
+
+
+def test_openai_response_leaves_final_answer_as_stop():
+    body = b"""{
+      "final_result": {
+        "choices": [{
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "The federation concept is a metadata-driven integration layer."
+          },
+          "finish_reason": "stop"
+        }]
+      }
+    }"""
+
+    response = _as_openai_response(body, {"tools": [{"type": "function", "function": {"name": "read_file"}}]})
+
+    assert b'"finish_reason": "stop"' in response

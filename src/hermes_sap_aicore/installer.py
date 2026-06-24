@@ -114,6 +114,20 @@ def configure_config_yaml(
         # providers.sap-aicore entry, so correct it when SAP AI Core is active.
         model["base_url"] = proxy_url
 
+    agent = data.get("agent")
+    if not isinstance(agent, dict):
+        agent = {}
+    enforcement = agent.get("tool_use_enforcement", "auto")
+    if enforcement == "auto":
+        # Hermes' "auto" enforcement skips Claude. SAP AI Core exposes Claude
+        # through an OpenAI-compatible orchestration proxy, where the extra
+        # guidance is needed to avoid "I'll read..." text responses instead of
+        # actual follow-up tool calls.
+        agent["tool_use_enforcement"] = ["anthropic--", "gpt", "codex", "gemini", "grok", "qwen", "deepseek"]
+    elif isinstance(enforcement, list) and not any(str(item).lower() == "anthropic--" for item in enforcement):
+        agent["tool_use_enforcement"] = ["anthropic--", *enforcement]
+    data["agent"] = agent
+
     if config_path.exists():
         backup = config_path.with_name(config_path.name + ".bak")
         backup.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
