@@ -67,7 +67,67 @@ def _append_env(env_path: Path, values: dict[str, str]) -> None:
     env_path.write_text(existing + prefix + "\n".join(lines) + "\n", encoding="utf-8")
 
 
-def install(hermes_home: Path, *, write_env: bool, env_values: dict[str, str]) -> Path:
+def configure_config_yaml(
+    config_path: Path,
+    *,
+    proxy_url: str,
+    key_env: str = "SAP_AICORE_PROXY_KEY",
+    display_name: str = "SAP AI Core",
+) -> bool:
+    """Register ``sap-aicore`` under ``providers:`` so the /model picker can switch to it.
+
+    The interactive ``/model`` switch resolves providers through
+    ``hermes_cli/providers.py`` (models.dev + config.yaml ``providers:``), which is
+    independent of the plugin registry. Without this entry the picker lists the
+    provider but switching fails with "Unknown provider 'sap-aicore'".
+
+    Returns True when the file was written.
+    """
+    try:
+        import yaml
+    except Exception:
+        return False
+
+    data: dict = {}
+    if config_path.exists():
+        try:
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return False
+
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers["sap-aicore"] = {
+        "name": display_name,
+        "base_url": proxy_url,
+        "key_env": key_env,
+        "transport": "openai_chat",
+    }
+    data["providers"] = providers
+
+    if config_path.exists():
+        backup = config_path.with_name(config_path.name + ".bak")
+        backup.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(data, sort_keys=False, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return True
+
+
+def install(
+    hermes_home: Path,
+    *,
+    write_env: bool,
+    env_values: dict[str, str],
+    write_config: bool = False,
+    proxy_url: str = "http://127.0.0.1:8765/v1",
+    key_env: str = "SAP_AICORE_PROXY_KEY",
+) -> Path:
     provider_dir = hermes_home / "plugins" / "model-providers" / "sap-aicore"
     provider_dir.mkdir(parents=True, exist_ok=True)
     (provider_dir / "__init__.py").write_text(PLUGIN_INIT, encoding="utf-8")
@@ -77,6 +137,9 @@ def install(hermes_home: Path, *, write_env: bool, env_values: dict[str, str]) -
     if write_env:
         _append_env(hermes_home / ".env", env_values)
 
+    if write_config:
+        configure_config_yaml(hermes_home / "config.yaml", proxy_url=proxy_url, key_env=key_env)
+
     return provider_dir
 
 
@@ -85,28 +148,52 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hermes-home", type=Path, default=_hermes_home())
     parser.add_argument("--service-key", help="Path to SAP AI Core service-key JSON.")
     parser.add_argument("--deployment-id", help="Default SAP AI Core deployment id.")
-    parser.add_argument("--model-name", help="Foundation model name for orchestration mode, e.g. anthropic--claude-4.5-sonnet.")
-    parser.add_argument("--api-mode", choices=("foundation", "orchestration"), default="foundation")
+    parser.add_argument("--model-name", help="Default foundation model name for orchestration mode, e.g. anthropic--claude-4.5-sonnet.")
+    parser.add_argument(
+        "--models",
+        help="Optional comma-separated list to pin the model picker. Omit to list all live AI Core models.",
+    )
+    parser.add_argument("--api-mode", choices=("foundation", "orchestration"), default="orchestration")
     parser.add_argument("--resource-group", default="default", help="SAP AI Core resource group.")
     parser.add_argument("--proxy-url", default="http://127.0.0.1:8765/v1")
     parser.add_argument("--proxy-key", default="local-sap-aicore")
     parser.add_argument("--write-env", action="store_true", help="Append non-existing values to HERMES_HOME/.env.")
+    parser.add_argument(
+        "--write-config",
+        action="store_true",
+        help="Register sap-aicore in HERMES_HOME/config.yaml so the /model picker can switch to it.",
+    )
     args = parser.parse_args(argv)
 
     env_values = {
         "SAP_AICORE_SERVICE_KEY": args.service_key or "",
         "SAP_AICORE_DEPLOYMENT_ID": args.deployment_id or "",
         "SAP_AICORE_MODEL_NAME": args.model_name or "",
+        # Leave SAP_AICORE_MODELS empty unless explicitly pinned, so the proxy
+        # lists every live AI Core model in the picker.
+        "SAP_AICORE_MODELS": args.models or "",
         "SAP_AICORE_API_MODE": args.api_mode or "",
         "SAP_AICORE_RESOURCE_GROUP": args.resource_group or "",
         "SAP_AICORE_PROXY_BASE_URL": args.proxy_url or "",
         "SAP_AICORE_PROXY_KEY": args.proxy_key or "",
     }
-    provider_dir = install(args.hermes_home.expanduser(), write_env=args.write_env, env_values=env_values)
+    # config.yaml registration is what makes the interactive /model switch work,
+    # so enable it whenever the user is doing the env-writing setup pass.
+    write_config = args.write_config or args.write_env
+    provider_dir = install(
+        args.hermes_home.expanduser(),
+        write_env=args.write_env,
+        env_values=env_values,
+        write_config=write_config,
+        proxy_url=args.proxy_url or "http://127.0.0.1:8765/v1",
+        key_env="SAP_AICORE_PROXY_KEY",
+    )
     print(f"Installed SAP AI Core Hermes provider: {provider_dir}")
     if args.write_env:
         print(f"Updated environment file: {args.hermes_home.expanduser() / '.env'}")
-    else:
+    if write_config:
+        print(f"Registered provider in: {args.hermes_home.expanduser() / 'config.yaml'}")
+    if not args.write_env:
         print("Set SAP_AICORE_SERVICE_KEY, SAP_AICORE_DEPLOYMENT_ID, and SAP_AICORE_PROXY_KEY before running Hermes.")
     return 0
 

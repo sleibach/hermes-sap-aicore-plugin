@@ -128,15 +128,96 @@ def _text_response(handler: BaseHTTPRequestHandler, status: int, body: bytes, co
     handler.wfile.write(body)
 
 
-def _models_payload() -> dict[str, Any]:
-    configured = (
-        os.getenv("SAP_AICORE_MODELS", "").strip()
-        or os.getenv("SAP_AICORE_DEPLOYMENT_ID", "").strip()
-        or os.getenv("AICORE_DEPLOYMENT_ID", "").strip()
+def _active_mode() -> str:
+    mode = os.getenv("SAP_AICORE_API_MODE", os.getenv("SAP_AICORE_DEPLOYMENT_TYPE", "foundation")).strip().lower()
+    return "orchestration" if mode in {"orchestration", "orchestration-v2", "orchestration_v2"} else "foundation"
+
+
+def _is_chat_model(name: str) -> bool:
+    lowered = (name or "").lower()
+    if not lowered:
+        return False
+    if "embed" in lowered or "embedqa" in lowered:
+        return False
+    if lowered.startswith("sap-rpt") or "rpt-1" in lowered:
+        return False
+    return True
+
+
+def _fetch_deployments(config: AiCoreConfig, token: str) -> list[dict[str, Any]]:
+    url = config.inference_base_url + "/lm/deployments?" + urllib.parse.urlencode({"status": "RUNNING"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "AI-Resource-Group": config.resource_group,
+            "Accept": "application/json",
+        },
     )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    resources = data.get("resources") or data.get("data") or []
+    return [item for item in resources if isinstance(item, dict)]
+
+
+def _deployment_model_name(deployment: dict[str, Any]) -> str:
+    details = deployment.get("details") if isinstance(deployment.get("details"), dict) else {}
+    resources = details.get("resources") if isinstance(details.get("resources"), dict) else {}
+    backend = resources.get("backendDetails") or resources.get("backend_details") or {}
+    model = backend.get("model") if isinstance(backend, dict) else None
+    if isinstance(model, dict):
+        return str(model.get("name") or "").strip()
+    return ""
+
+
+def _live_models() -> list[str]:
+    """Query SAP AI Core for the catalog the active mode can actually serve."""
+    config = load_config(os.getenv("SAP_AICORE_DEPLOYMENT_ID", "") or os.getenv("AICORE_DEPLOYMENT_ID", "") or "list")
+    token = TOKEN_CACHE.get(config)
+    deployments = _fetch_deployments(config, token)
+
+    if _active_mode() == "orchestration":
+        names = sorted(
+            {
+                name
+                for dep in deployments
+                if dep.get("scenarioId") in {"foundation-models", None} or _deployment_model_name(dep)
+                for name in [_deployment_model_name(dep)]
+                if _is_chat_model(name)
+            }
+        )
+        return names
+
+    # Foundation mode routes by deployment id, so the model id IS the deployment id.
+    ids = []
+    for dep in deployments:
+        if dep.get("scenarioId") not in {"foundation-models", None}:
+            continue
+        if not _is_chat_model(_deployment_model_name(dep)):
+            continue
+        dep_id = str(dep.get("id") or "").strip()
+        if dep_id:
+            ids.append(dep_id)
+    return sorted(ids)
+
+
+def _models_payload() -> dict[str, Any]:
+    from .config import _load_hermes_dotenv
+
+    _load_hermes_dotenv()
+    configured = os.getenv("SAP_AICORE_MODELS", "").strip()
     models = [item.strip() for item in configured.replace(";", ",").split(",") if item.strip()]
+
     if not models:
-        models = ["sap-aicore-deployment"]
+        try:
+            models = _live_models()
+        except Exception as exc:
+            LOGGER.warning("Live model listing failed, falling back to configured model: %s", exc)
+
+    if not models:
+        fallback = os.getenv("SAP_AICORE_MODEL_NAME", "").strip()
+        models = [fallback] if fallback else ["sap-aicore-model"]
+
     return {
         "object": "list",
         "data": [{"id": model, "object": "model", "owned_by": "sap-ai-core"} for model in models],
@@ -165,9 +246,13 @@ def _model_params(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _orchestration_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    model_name = os.getenv("SAP_AICORE_MODEL_NAME", "").strip() or str(payload.get("model") or "").strip()
-    if not model_name or model_name == "sap-aicore-deployment":
-        raise ConfigError("SAP_AICORE_MODEL_NAME or Hermes model must contain the AI Core foundation model name")
+    # The model picked in Hermes wins; the env default is only a fallback so a
+    # bare `hermes` session without an explicit model still works.
+    model_name = str(payload.get("model") or "").strip()
+    if not model_name or model_name in {"sap-aicore-model", "sap-aicore-deployment"}:
+        model_name = os.getenv("SAP_AICORE_MODEL_NAME", "").strip()
+    if not model_name or model_name in {"sap-aicore-model", "sap-aicore-deployment"}:
+        raise ConfigError("Hermes model or SAP_AICORE_MODEL_NAME must contain the AI Core foundation model name")
 
     prompt: dict[str, Any] = {"template": payload.get("messages") or []}
     if payload.get("tools"):
@@ -292,8 +377,7 @@ def _forward_orchestration_completion(payload: dict[str, Any]) -> tuple[int, byt
 
 
 def _forward_chat_completion(payload: dict[str, Any]) -> tuple[int, bytes, str]:
-    mode = os.getenv("SAP_AICORE_API_MODE", os.getenv("SAP_AICORE_DEPLOYMENT_TYPE", "foundation")).strip().lower()
-    if mode in {"orchestration", "orchestration-v2", "orchestration_v2"}:
+    if _active_mode() == "orchestration":
         return _forward_orchestration_completion(payload)
     return _forward_foundation_chat_completion(payload)
 
