@@ -48,6 +48,15 @@ def test_configure_config_yaml_registers_provider(tmp_path):
     assert entry["key_env"] == "SAP_AICORE_PROXY_KEY"
     assert entry["transport"] == "openai_chat"
     assert data["model"]["base_url"] == "http://127.0.0.1:8765/v1"
+    assert data["agent"]["tool_use_enforcement"] == [
+        "anthropic--",
+        "gpt",
+        "codex",
+        "gemini",
+        "grok",
+        "qwen",
+        "deepseek",
+    ]
     # Existing config is preserved and a backup is written.
     assert data["model"]["provider"] == "sap-aicore"
     assert (tmp_path / "config.yaml.bak").exists()
