@@ -4,11 +4,13 @@ import hermes_sap_aicore.proxy as proxy
 from hermes_sap_aicore.config import AiCoreConfig
 from hermes_sap_aicore.proxy import (
     _aicore_url,
+    _as_openai_sse,
     _active_mode,
     _deployment_from_model,
     _deployment_model_name,
     _is_chat_model,
     _models_payload,
+    _orchestration_messages,
     _orchestration_payload,
     _orchestration_url,
 )
@@ -132,3 +134,67 @@ def test_orchestration_payload_falls_back_to_env_when_model_placeholder(monkeypa
         {"model": "sap-aicore-model", "messages": [{"role": "user", "content": "Hi"}]}
     )
     assert payload["config"]["modules"]["prompt_templating"]["model"]["name"] == "anthropic--claude-4.5-sonnet"
+
+
+def test_orchestration_messages_convert_tool_results_to_system_messages():
+    messages = _orchestration_messages(
+        [
+            {"role": "user", "content": "Where am I?"},
+            {"role": "assistant", "content": None, "tool_calls": []},
+            {
+                "role": "assistant",
+                "content": "I'll check.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\":\"pwd\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "/Users/soeren.leibach"},
+        ]
+    )
+
+    assert len(messages) == 3
+    assert "tool_calls" not in messages[1]
+    assert messages[-1] == {
+        "role": "user",
+        "content": "Tool result (call_1):\n/Users/soeren.leibach",
+    }
+
+
+def test_openai_sse_preserves_tool_calls():
+    body = b"""{
+      "final_result": {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "anthropic--claude-4.7-opus",
+        "choices": [{
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "I'll inspect the project.",
+            "tool_calls": [{
+              "id": "call_123",
+              "type": "function",
+              "function": {
+                "name": "terminal",
+                "arguments": "{\\"command\\": \\"pwd\\"}"
+              }
+            }]
+          },
+          "finish_reason": "tool_calls"
+        }]
+      }
+    }"""
+
+    sse = _as_openai_sse(body).decode("utf-8")
+
+    assert "\"content\": \"I'll inspect the project.\"" in sse
+    assert '"tool_calls"' in sse
+    assert '"id": "call_123"' in sse
+    assert '"name": "terminal"' in sse
+    assert '"arguments": "{\\"command\\": \\"pwd\\"}"' in sse
+    assert '"finish_reason": "tool_calls"' in sse

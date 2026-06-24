@@ -107,6 +107,13 @@ def configure_config_yaml(
     }
     data["providers"] = providers
 
+    model = data.get("model")
+    if isinstance(model, dict) and str(model.get("provider") or "").strip().lower() == "sap-aicore":
+        # Hermes may keep a stale model-level base_url from the previously
+        # active provider. Runtime resolution prefers that value over the
+        # providers.sap-aicore entry, so correct it when SAP AI Core is active.
+        model["base_url"] = proxy_url
+
     if config_path.exists():
         backup = config_path.with_name(config_path.name + ".bak")
         backup.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
